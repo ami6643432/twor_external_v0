@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="Arm">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="0 0 -1"
+        rpy="0 0 0" />
+      <mass
+        value="0.08" />
+      <inertia
+        ixx="1.2988E-05"
+        ixy="-2.8598E-14"
+        ixz="2.3385E-17"
+        iyy="9.0006E-06"
+        iyz="-1.4322E-07"
+        izz="1.263E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="Link1">
+    <inertial>
+      <origin
+        xyz="-0.049919 -0.10242 -0.0083909"
+        rpy="0 0 0" />
+      <mass
+        value="0.05" />
+      <inertia
+        ixx="1.4554E-05"
+        ixy="-4.0614E-07"
+        ixz="4.2464E-07"
+        iyy="9.6663E-06"
+        iyz="-1.3744E-06"
+        izz="2.1973E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/Link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/Link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Servo1"
+    type="continuous">
+    <origin
+      xyz="0.017875 -0.45598 -0.03525"
+      rpy="1.454 -0.071221 1.5099" />
+    <parent
+      link="base_link" />
+    <child
+      link="Link1" />
+    <axis
+      xyz="0.99562 -0.063458 -0.068705" />
+  </joint>
+  <link
+    name="Link2">
+    <inertial>
+      <origin
+        xyz="-0.024424 0.023266 0.0028645"
+        rpy="0 0 0" />
+      <mass
+        value="0.15" />
+      <inertia
+        ixx="1.9036E-05"
+        ixy="-8.9651E-07"
+        ixz="-3.1231E-08"
+        iyy="9.108E-06"
+        iyz="-4.9489E-07"
+        izz="1.9277E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/Link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/Link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Servo2"
+    type="continuous">
+    <origin
+      xyz="-0.034252 -0.20903 -0.021308"
+      rpy="-3.0799 0.14156 -0.12292" />
+    <parent
+      link="Link1" />
+    <child
+      link="Link2" />
+    <axis
+      xyz="0.99562 -0.063458 -0.068705" />
+  </joint>
+  <link
+    name="Sensor">
+    <inertial>
+      <origin
+        xyz="0.071352 0.48968 0.038578"
+        rpy="0 0 0" />
+      <mass
+        value="0.15" />
+      <inertia
+        ixx="1.3097E-05"
+        ixy="7.4282E-07"
+        ixz="-9.3693E-08"
+        iyy="2.4179E-05"
+        iyz="5.7935E-07"
+        izz="1.2933E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/Sensor.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.79216 0.81961 0.93333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="../meshes/Sensor.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Clamp"
+    type="continuous">
+    <origin
+      xyz="-0.0351 -0.30046 -0.052517"
+      rpy="-0.26934 -1.4924 0.15686" />
+    <parent
+      link="Link2" />
+    <child
+      link="Sensor" />
+    <axis
+      xyz="0 0 0" />
+  </joint>
+</robot>
