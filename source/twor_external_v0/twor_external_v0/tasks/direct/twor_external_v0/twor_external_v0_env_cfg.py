@@ -1,48 +1,73 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
-
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG
-
-from isaaclab.assets import ArticulationCfg
+import numpy as np
+from gymnasium.spaces import Box
+from isaaclab.utils import configclass
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
-from isaaclab.utils import configclass
+from isaaclab.assets import ArticulationCfg
 
+from twor_external_v0.robots.twor import TWOR_CONFIG
+
+# module‐level constants
+Kmax = 500.0    # max stiffness
+Dmax = 20.0     # max damping
 
 @configclass
 class TworExternalV0EnvCfg(DirectRLEnvCfg):
-    # env
-    decimation = 2
-    episode_length_s = 5.0
-    # - spaces definition
-    action_space = 1
-    observation_space = 4
-    state_space = 0
+    # ————— Run settings —————
+    decimation       = 1
+    episode_length_s = 10.0
 
-    # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    # ————— Spaces —————
+    # 4 actions: [k1, d1, k2, d2]
+    action_space: Box = Box(
+        low = np.array([1e-3, 1e-3, 1e-3, 1e-3], dtype=np.float32),
+        high= np.array([Kmax, Dmax, Kmax, Dmax], dtype=np.float32),
+        dtype=np.float32
+    )
+    # 15 obs: [Fx, Fy, Fz, q1, q2, q1_des, q2_des,
+    #          q1_dot, q2_dot, q1_dot_des, q2_dot_des,
+    #          q1_ddot, q2_ddot, q1_ddot_des, q2_ddot_des]
+    observation_space: Box = Box(
+        low=-np.inf, high=np.inf, shape=(15,), dtype=np.float32
+    )
 
-    # robot(s)
-    robot_cfg: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    # ————— Physics —————
+    sim: SimulationCfg = SimulationCfg(
+        dt=1/120,
+        render_interval=decimation
+    )
 
-    # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    # ————— Robot —————
+    robot_cfg: ArticulationCfg = TWOR_CONFIG.replace(
+        prim_path="/World/envs/env_.*/Twor",
+        spawn=TWOR_CONFIG.spawn.replace(activate_contact_sensors=True)
+    )
 
-    # custom parameters/scales
-    # - controllable joint
-    cart_dof_name = "slider_to_cart"
-    pole_dof_name = "cart_to_pole"
-    # - action scale
-    action_scale = 100.0  # [N]
-    # - reward scales
-    rew_scale_alive = 1.0
-    rew_scale_terminated = -2.0
-    rew_scale_pole_pos = -1.0
-    rew_scale_cart_vel = -0.01
-    rew_scale_pole_vel = -0.005
-    # - reset states/conditions
-    initial_pole_angle_range = [-0.25, 0.25]  # pole angle sample range on reset [rad]
-    max_cart_pos = 3.0  # reset if cart exceeds this position [m]
+    # ————— Scene —————
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=50, env_spacing=2.0, replicate_physics=True
+    )
+
+    # ————— Joint names —————
+    servo1_dof_name = "Servo1"
+    servo2_dof_name = "Servo2"
+
+    # —— optional reward/done scales & limits ——
+    force_scale:      float = 1.0       # penalty weight for contact force
+    max_joint_pos:    float = 1.5708    # rad, 90°
+    max_allowed_force:float = 200.0     # N
+
+    # no extra “state” vector
+    state_space: int = 0
+
+    # in TworExternalV0EnvCfg
+    target_pos_x: float = -1                    # desired pos for the cube
+    w_pos: float = 10.0                       # weight on terminal position error
+    w_tracking: float = 1000.0                    # joint‐tracking weight
+    w_stiffness: float = 1e-6                  # stiffness penalty (small scale)
+
+    # ————— Asset paths —————
+    nvidia_cube_usd_path: str = "./Props/Blocks/nvidia_cube.usd"
+

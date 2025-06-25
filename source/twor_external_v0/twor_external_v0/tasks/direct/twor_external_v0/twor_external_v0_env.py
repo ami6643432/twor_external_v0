@@ -2,134 +2,205 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-
 from __future__ import annotations
 
 import math
 import torch
-from collections.abc import Sequence
-
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
-from isaaclab.envs import DirectRLEnv
+from collections.abc import Sequence
+from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import sample_uniform
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
+from isaaclab.envs import DirectRLEnv
+
+# from isaaclab.sim import UsdFileCfg, spawn_from_usd
+from isaaclab.sim import RigidBodyPropertiesCfg, MassPropertiesCfg, CollisionPropertiesCfg, RigidBodyMaterialCfg
+
 
 from .twor_external_v0_env_cfg import TworExternalV0EnvCfg
-
 
 class TworExternalV0Env(DirectRLEnv):
     cfg: TworExternalV0EnvCfg
 
-    def __init__(self, cfg: TworExternalV0EnvCfg, render_mode: str | None = None, **kwargs):
-        super().__init__(cfg, render_mode, **kwargs)
-
-        self._cart_dof_idx, _ = self.robot.find_joints(self.cfg.cart_dof_name)
-        self._pole_dof_idx, _ = self.robot.find_joints(self.cfg.pole_dof_name)
-
+    def __init__(self, cfg: TworExternalV0EnvCfg, render_mode=None, **kwargs):
+        super().__init__(cfg, render_mode=render_mode, **kwargs)
+        # joint indices for controlled joints
+        self._servo1_idx, _ = self.robot.find_joints(self.cfg.servo1_dof_name)
+        self._servo2_idx, _ = self.robot.find_joints(self.cfg.servo2_dof_name)
+        self._joint_ids = [*self._servo1_idx, *self._servo2_idx]
+        # state references
         self.joint_pos = self.robot.data.joint_pos
         self.joint_vel = self.robot.data.joint_vel
+        # default joint offsets
+        idxs = self._joint_ids
+        default_pos = self.robot.data.default_joint_pos[:, idxs].clone()
+        self._desired_pos = default_pos.clone()
+        self._offset = default_pos.clone()
+        # buffers for finite-difference
+        self._prev_vel = torch.zeros_like(self.joint_vel[:, idxs])
+        self._prev_desired_pos = default_pos.clone()
+        self._prev_desired_vel = torch.zeros_like(self._prev_vel)
+        # counter for hardcoded trajectory
+        self._count = 0
+        self._max_count = 1000
 
-    def _setup_scene(self):
+    def _setup_scene(self) -> None:
+        # spawn articulation & ground
         self.robot = Articulation(self.cfg.robot_cfg)
-        # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
-        # we need to explicitly filter collisions for CPU simulation
         if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[])
-        # add articulation to scene
-        self.scene.articulations["robot"] = self.robot
-        # add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+            self.scene.filter_collisions(global_prim_paths=[r"/World/envs/env_.*/.*"])
+        self.scene.articulations["twor"] = self.robot
+        # lighting
+        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+        # spawn rigid object (cube)
+        cube_cfg = RigidObjectCfg(
+            prim_path="/World/envs/env_.*/Cube",
+            spawn=sim_utils.CuboidCfg(
+                size=(0.25, 0.25, 0.25),
+                rigid_props=RigidBodyPropertiesCfg(),
+                mass_props=MassPropertiesCfg(mass=100.0),
+                collision_props=CollisionPropertiesCfg(),
+                physics_material=RigidBodyMaterialCfg(),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.3, 0, 0.25)),
+        )
+        self.scene.rigid_objects["Cube"] = RigidObject(cube_cfg)
+        # contact sensor
+        sensor_cfg = ContactSensorCfg(
+            prim_path="/World/envs/env_.*/Twor/Link2",
+            update_period=0.0, history_length=1, debug_vis=False,
+            filter_prim_paths_expr=["/World/envs/env_.*/Cube"],
+        )
+
+        # attach contact sensor to Link2 of Twor
+        self.scene.sensors["contact_L2"] = ContactSensor(sensor_cfg)
+
+        
+
+
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = actions.clone()
+        # actions: [k1, d1, k2, d2]
+        self._actions = actions.clone()
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_effort_target(self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx)
+        # unpack impedance gains
+        k1, d1, k2, d2 = torch.unbind(self._actions, dim=-1)
+        stiff = torch.stack([k1, k2], dim=-1)
+        damp = torch.stack([d1, d2], dim=-1)
+        # compute hardcoded linear trajectory
+        frac = (self._count % self._max_count) / self._max_count
+        q1 = (math.pi/2) * frac - (math.pi/8)
+        q2 = - (math.pi/2) * frac + (math.pi/2) + (math.pi/8)
+        q_des = self._offset.clone()
+        q_des[:, 0] = q1
+        q_des[:, 1] = q2
+        # apply impedance via direct joint stiffness/damping and position target
+
+        # self.robot.write_joint_stiffness_to_sim(stiffness=stiff, joint_ids=self._joint_ids)
+        # self.robot.write_joint_damping_to_sim(damping=damp, joint_ids=self._joint_ids)
+        self.robot.set_joint_position_target(q_des, joint_ids=self._joint_ids)
+        self.robot.write_data_to_sim()
+        # update for next step
+        self._desired_pos = q_des.clone()
+        self._count += 1
 
     def _get_observations(self) -> dict:
-        obs = torch.cat(
-            (
-                self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-            ),
-            dim=-1,
-        )
-        observations = {"policy": obs}
-        return observations
+        idxs = self._joint_ids
+        dt = self.cfg.sim.dt
+        forces = self.scene["contact_L2"].data.net_forces_w.squeeze(1)
+        pos = self.joint_pos[:, idxs]
+        des = self._desired_pos
+        vel = self.joint_vel[:, idxs]
+        # finite differences
+        des_vel = (des - self._prev_desired_pos) / dt
+        act_acc = (vel - self._prev_vel) / dt
+        des_acc = (des_vel - self._prev_desired_vel) / dt
+        # update buffers
+        self._prev_vel = vel.clone()
+        self._prev_desired_pos = des.clone()
+        self._prev_desired_vel = des_vel.clone()
+        obs = torch.cat([forces, pos, des, vel, des_vel, act_acc, des_acc], dim=-1)
+        return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        total_reward = compute_rewards(
-            self.cfg.rew_scale_alive,
-            self.cfg.rew_scale_terminated,
-            self.cfg.rew_scale_pole_pos,
-            self.cfg.rew_scale_cart_vel,
-            self.cfg.rew_scale_pole_vel,
-            self.joint_pos[:, self._pole_dof_idx[0]],
-            self.joint_vel[:, self._pole_dof_idx[0]],
-            self.joint_pos[:, self._cart_dof_idx[0]],
-            self.joint_vel[:, self._cart_dof_idx[0]],
-            self.reset_terminated,
-        )
-        return total_reward
+        # --- 1) Terminal position cost (only on last step) -------------------
+        # spawn x from default state (world frame)
+        spawn_x = self.scene.rigid_objects["Cube"].data.default_root_state[:, 0]
+        # target x is 1m negative from spawn
+        target_x = spawn_x - 1.0
+        # current cube x-position (world frame)
+        cube_x = self.scene.rigid_objects["Cube"].data.root_state_w[:, 0]
+        # squared distance to target
+        dist2 = (cube_x - target_x).pow(2)
+        # mask so terminal cost applies only at end of episode
+        terminal_mask = (self.episode_length_buf >= self.max_episode_length - 1).float()
+        c_pos = self.cfg.w_pos * dist2 * terminal_mask
+
+        # --- 2) Impedance tracking cost (per-step) -----------------------------
+        q = self.joint_pos[:, self._joint_ids]               # [N_env,2]
+        q_ref = self._desired_pos                            # [N_env,2]
+        track_cost = (q - q_ref).pow(2).sum(dim=-1)          # [N_env]
+        c_track = self.cfg.w_tracking * track_cost
+
+        # --- 3) Stiffness penalty (per-step) -----------------------------------
+        k1, _, k2, _ = torch.unbind(self._actions, dim=-1)
+        stiff = torch.stack([k1, k2], dim=-1)                # [N_env,2]
+        stiff_cost = stiff.pow(2).sum(dim=-1)                # [N_env]
+        c_k = self.cfg.w_stiffness * stiff_cost
+
+        # total negative cost = reward
+        reward = - (c_pos + c_track + c_k)
+        return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
-
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1)
-        return out_of_bounds, time_out
+        force_violation = torch.norm(
+            self.scene["contact_L2"].data.net_forces_w.squeeze(1), dim=-1
+        ) > self.cfg.max_allowed_force
+        done = time_out | force_violation
+        return done, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
+        super()._reset_idx(env_ids)
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
-        super()._reset_idx(env_ids)
 
-        joint_pos = self.robot.data.default_joint_pos[env_ids]
-        joint_pos[:, self._pole_dof_idx] += sample_uniform(
-            self.cfg.initial_pole_angle_range[0] * math.pi,
-            self.cfg.initial_pole_angle_range[1] * math.pi,
-            joint_pos[:, self._pole_dof_idx].shape,
-            joint_pos.device,
+        # reset trajectory buffers and counter
+        idxs = self._joint_ids
+        default_pos = self.robot.data.default_joint_pos[:, idxs].clone()
+        self._desired_pos = default_pos.clone()
+        self._prev_desired_pos = default_pos.clone()
+        self._prev_vel = torch.zeros_like(self.joint_vel[:, idxs])
+        self._prev_desired_vel = torch.zeros_like(self._prev_vel)
+        self._count = 0
+
+        # reset robot base pose & velocity
+        root_states = self.robot.data.default_root_state[env_ids].clone()
+        root_states[:, :3] += self.scene.env_origins[env_ids]
+        self.robot.write_root_pose_to_sim(root_states[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(root_states[:, 7:], env_ids)
+
+        # reset all joint states
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        self.robot.write_joint_state_to_sim(
+            position=joint_pos,
+            velocity=joint_vel,
+            env_ids=env_ids
         )
-        joint_vel = self.robot.data.default_joint_vel[env_ids]
 
-        default_root_state = self.robot.data.default_root_state[env_ids]
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        # reset cube object
+        if "Cube" in self.scene.rigid_objects:
+            obj = self.scene.rigid_objects["Cube"]
+            default_state = obj.data.default_root_state[env_ids].clone()
+            default_state[:, :3] += self.scene.env_origins[env_ids]
+            obj.write_root_pose_to_sim(default_state[:, :7], env_ids)
+            obj.write_root_velocity_to_sim(default_state[:, 7:], env_ids)
 
-        self.joint_pos[env_ids] = joint_pos
-        self.joint_vel[env_ids] = joint_vel
-
-        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
-
-@torch.jit.script
-def compute_rewards(
-    rew_scale_alive: float,
-    rew_scale_terminated: float,
-    rew_scale_pole_pos: float,
-    rew_scale_cart_vel: float,
-    rew_scale_pole_vel: float,
-    pole_pos: torch.Tensor,
-    pole_vel: torch.Tensor,
-    cart_pos: torch.Tensor,
-    cart_vel: torch.Tensor,
-    reset_terminated: torch.Tensor,
-):
-    rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
-    rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
-    total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
-    return total_reward
+        # push updated cube state into sim immediately
+        self.scene.write_data_to_sim()

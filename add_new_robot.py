@@ -35,7 +35,7 @@ from isaaclab.sensors import ContactSensorCfg
 from twor_external_v0.robots.twor import TWOR_CONFIG
 
 
-class NewRobotsSceneCfg(InteractiveSceneCfg):
+class TworSceneCfg(InteractiveSceneCfg):
     """Designs the scene."""
 
     # Ground-plane
@@ -134,7 +134,7 @@ def main():
 
     sim.set_camera_view([3.5, 0.0, 3.2], [0.0, 0.0, 0.5])
     # design scene
-    scene_cfg = NewRobotsSceneCfg(args_cli.num_envs, env_spacing=2.0)
+    scene_cfg = TworSceneCfg(args_cli.num_envs, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
     # Play the simulator
     sim.reset()
