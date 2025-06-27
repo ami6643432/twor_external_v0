@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Observation terms for learned impedance control."""
+"""Observation terms for variable impedance control RL training."""
 
 from __future__ import annotations
 
@@ -18,277 +18,305 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
-class ImpedanceStateObsTerm(ObservationTerm):
-    """Observation term for current impedance parameters and tracking errors."""
+@configclass
+class ImpedanceStateObsTermCfg(ObservationTermCfg):
+    """Configuration for impedance state observation term."""
     
-    def __init__(self, cfg: "ImpedanceStateObsTermCfg", env: "ManagerBasedEnv"):
+    class_type: type[ObservationTerm] = "ImpedanceStateObsTerm"
+    
+    # Asset and action term names
+    asset_name: str = "robot"
+    """Name of the robot asset."""
+    
+    action_term_name: str = "impedance_action"
+    """Name of the variable impedance action term."""
+    
+    # What to include in observations
+    include_current_impedance: bool = True
+    """Include normalized current stiffness and damping values."""
+    
+    include_tracking_errors: bool = True
+    """Include position and velocity tracking errors."""
+    
+    include_joint_states: bool = True
+    """Include current joint positions and velocities."""
+    
+    # Normalization ranges for impedance parameters
+    stiffness_range: tuple[float, float] = (10.0, 5000.0)
+    """Range for normalizing stiffness values."""
+    
+    damping_range: tuple[float, float] = (0.1, 100.0)
+    """Range for normalizing damping values."""
+    
+    # Normalization for tracking errors
+    max_position_error: float = 0.5
+    """Maximum expected position error for normalization [rad]."""
+    
+    max_velocity_error: float = 5.0
+    """Maximum expected velocity error for normalization [rad/s]."""
+
+
+class ImpedanceStateObsTerm(ObservationTerm):
+    """Observation term for current impedance parameters and control state.
+    
+    Provides the RL agent with:
+    - Current stiffness and damping parameters (normalized)
+    - Position and velocity tracking errors
+    - Current joint positions and velocities
+    """
+    
+    cfg: ImpedanceStateObsTermCfg
+    
+    def __init__(self, cfg: ImpedanceStateObsTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         
         # Get robot asset
-        self._asset = env.scene[cfg.asset_name]
+        self._asset: Articulation = env.scene[cfg.asset_name]
         
-        # Get action term to access impedance parameters
+        # Get variable impedance action term
         self._action_term = env.action_manager._terms[cfg.action_term_name]
         
-        # Get joint indices from action term
+        # Get joint indices (should be 2 for Servo1, Servo2)
         self._joint_ids = self._action_term._joint_ids
-        self._num_joints = self._action_term._num_joints
+        self._num_joints = len(self._joint_ids)
     
     @property
     def data(self) -> torch.Tensor:
         """
-        Returns impedance-related observations:
-        - Current stiffness values (normalized)
-        - Current damping values (normalized)  
-        - Position tracking errors
-        - Velocity tracking errors
+        Returns impedance control state observations.
         """
         obs_list = []
         
-        # Get current joint states
-        joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
-        
-        # Get target positions from action term
-        desired_pos = self._action_term.desired_positions
-        desired_vel = self._action_term._desired_vel
-        
-        # Compute tracking errors
-        pos_error = desired_pos - joint_pos
-        vel_error = desired_vel - joint_vel
-        
-        # Add tracking errors
-        if self.cfg.include_position_error:
-            obs_list.append(pos_error)
-        
-        if self.cfg.include_velocity_error:
-            obs_list.append(vel_error)
-        
-        # Add current impedance parameters (normalized to [-1, 1])
-        if self.cfg.include_stiffness:
+        # Current impedance parameters (normalized to [-1, 1])
+        if self.cfg.include_current_impedance:
             current_stiffness = self._action_term.current_stiffness
-            stiffness_normalized = (
-                2.0 * (current_stiffness - self.cfg.stiffness_min) / 
-                (self.cfg.stiffness_max - self.cfg.stiffness_min) - 1.0
-            )
-            obs_list.append(stiffness_normalized)
-        
-        if self.cfg.include_damping:
             current_damping = self._action_term.current_damping
-            # Normalize damping based on configured range
-            damping_normalized = (
-                2.0 * (current_damping - self.cfg.damping_min) / 
-                (self.cfg.damping_max - self.cfg.damping_min) - 1.0
+            
+            # Normalize stiffness to [-1, 1]
+            stiffness_normalized = (
+                2.0 * (current_stiffness - self.cfg.stiffness_range[0]) / 
+                (self.cfg.stiffness_range[1] - self.cfg.stiffness_range[0]) - 1.0
             )
-            obs_list.append(damping_normalized)
+            
+            # Normalize damping to [-1, 1]
+            damping_normalized = (
+                2.0 * (current_damping - self.cfg.damping_range[0]) / 
+                (self.cfg.damping_range[1] - self.cfg.damping_range[0]) - 1.0
+            )
+            
+            obs_list.extend([stiffness_normalized, damping_normalized])
         
-        # Add joint torques if requested
-        if self.cfg.include_joint_torques:
-            joint_torques = self._asset.data.joint_effort_target[:, self._joint_ids]
-            # Normalize torques
-            if self.cfg.torque_normalization is not None:
-                joint_torques = joint_torques / self.cfg.torque_normalization
-            obs_list.append(joint_torques)
+        # Current joint states
+        if self.cfg.include_joint_states:
+            joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
+            joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
+            
+            # Normalize joint positions (assuming typical range [-π, π])
+            joint_pos_normalized = joint_pos / 3.14159
+            
+            # Normalize joint velocities
+            joint_vel_normalized = joint_vel / self.cfg.max_velocity_error
+            
+            obs_list.extend([joint_pos_normalized, joint_vel_normalized])
+        
+        # Tracking errors
+        if self.cfg.include_tracking_errors:
+            desired_pos = self._action_term.desired_joint_positions
+            current_pos = self._asset.data.joint_pos[:, self._joint_ids]
+            current_vel = self._asset.data.joint_vel[:, self._joint_ids]
+            
+            # Position tracking error
+            pos_error = desired_pos - current_pos
+            pos_error_normalized = pos_error / self.cfg.max_position_error
+            
+            # Velocity tracking error (assuming desired velocity is zero)
+            vel_error = -current_vel  # Since desired vel is typically 0
+            vel_error_normalized = vel_error / self.cfg.max_velocity_error
+            
+            obs_list.extend([pos_error_normalized, vel_error_normalized])
         
         # Concatenate all observations
         return torch.cat(obs_list, dim=-1)
 
 
-class ExternalForceObsTerm(ObservationTerm):
-    """Observation term for external force/torque estimates using momentum observer."""
+@configclass
+class ContactForceObsTermCfg(ObservationTermCfg):
+    """Configuration for contact force observation term."""
     
-    def __init__(self, cfg: "ExternalForceObsTermCfg", env: "ManagerBasedEnv"):
+    class_type: type[ObservationTerm] = "ContactForceObsTerm"
+    
+    # Asset configuration
+    asset_name: str = "robot"
+    """Name of the robot asset."""
+    
+    contact_sensor_names: list[str] = ["contact_sensor"]
+    """Names of contact sensors to read forces from."""
+    
+    # Force normalization
+    max_expected_force: float = 100.0
+    """Maximum expected contact force for normalization [N]."""
+    
+    include_force_magnitude: bool = True
+    """Include magnitude of contact force."""
+    
+    include_force_components: bool = False
+    """Include x, y, z components of contact force."""
+
+
+class ContactForceObsTerm(ObservationTerm):
+    """Observation term for contact forces from sensors.
+    
+    Provides the RL agent with contact force information from sensors
+    mounted on the robot (typically end-effector or specific links).
+    """
+    
+    cfg: ContactForceObsTermCfg
+    
+    def __init__(self, cfg: ContactForceObsTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         
-        # Get robot asset
-        self._asset = env.scene[cfg.asset_name]
-        
-        # Get joint indices
-        if cfg.joint_names is not None:
-            self._joint_ids, _ = self._asset.find_joints(cfg.joint_names)
-        else:
-            self._joint_ids = slice(None)
-        
-        # Momentum observer parameters
-        self._observer_gain = cfg.observer_gain
-        self._cutoff_freq = cfg.cutoff_freq
-        
-        # Internal states for momentum observer
-        num_joints = len(self._joint_ids) if isinstance(self._joint_ids, list) else self._asset.num_joints
-        self._momentum_estimate = torch.zeros(env.num_envs, num_joints, device=env.device)
-        self._external_torque_estimate = torch.zeros(env.num_envs, num_joints, device=env.device)
-        
-        # Previous velocity for numerical differentiation
-        self._prev_joint_vel = torch.zeros(env.num_envs, num_joints, device=env.device)
-        
-    def reset(self, env_ids: torch.Tensor) -> None:
-        """Reset observer states for specified environments."""
-        self._momentum_estimate[env_ids] = 0.0
-        self._external_torque_estimate[env_ids] = 0.0
-        current_vel = self._asset.data.joint_vel[env_ids, self._joint_ids]
-        self._prev_joint_vel[env_ids] = current_vel
+        # Get contact sensors
+        self._contact_sensors = []
+        for sensor_name in cfg.contact_sensor_names:
+            if sensor_name in env.scene:
+                self._contact_sensors.append(env.scene[sensor_name])
+            else:
+                print(f"Warning: Contact sensor '{sensor_name}' not found in scene")
     
     @property
     def data(self) -> torch.Tensor:
         """
-        Returns external force estimates using momentum observer:
-        - Estimated external joint torques
-        - Filtered external torques (optional)
+        Returns contact force observations.
         """
-        # Get current joint states
-        joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
-        joint_torques = self._asset.data.joint_effort_target[:, self._joint_ids]
-        
-        # Estimate joint accelerations (simple finite difference)
-        dt = self._env.physics_dt
-        joint_acc = (joint_vel - self._prev_joint_vel) / dt
-        self._prev_joint_vel = joint_vel.clone()
-        
-        # Momentum observer: p = I*q_dot
-        # dp/dt = I*q_ddot = tau + tau_ext
-        # tau_ext_estimate = dp/dt - tau_applied
-        
-        # For simplicity, assume unit inertia (can be improved with actual inertia)
-        estimated_inertia = self.cfg.estimated_inertia
-        momentum_current = estimated_inertia * joint_vel
-        
-        # Update momentum estimate with observer
-        momentum_error = momentum_current - self._momentum_estimate
-        self._momentum_estimate += self._observer_gain * momentum_error * dt
-        
-        # Estimate external torques
-        momentum_derivative = estimated_inertia * joint_acc
-        self._external_torque_estimate = momentum_derivative - joint_torques
-        
-        # Apply low-pass filter to reduce noise
-        alpha = dt * self._cutoff_freq / (1 + dt * self._cutoff_freq)
-        self._external_torque_estimate = (
-            alpha * self._external_torque_estimate + 
-            (1 - alpha) * self._external_torque_estimate
-        )
-        
         obs_list = []
         
-        # Add raw external torque estimates
-        if self.cfg.include_raw_estimates:
-            obs_list.append(self._external_torque_estimate)
+        for sensor in self._contact_sensors:
+            # Get contact forces from sensor
+            contact_forces = sensor.data.net_forces_w  # Shape: [num_envs, 3]
+            
+            if self.cfg.include_force_magnitude:
+                # Compute force magnitude
+                force_magnitude = torch.norm(contact_forces, dim=-1, keepdim=True)
+                force_magnitude_normalized = force_magnitude / self.cfg.max_expected_force
+                obs_list.append(force_magnitude_normalized)
+            
+            if self.cfg.include_force_components:
+                # Include x, y, z components
+                force_components_normalized = contact_forces / self.cfg.max_expected_force
+                obs_list.append(force_components_normalized)
         
-        # Add filtered/processed estimates
-        if self.cfg.include_filtered_estimates:
-            # Simple magnitude and direction
-            torque_magnitude = torch.norm(self._external_torque_estimate, dim=-1, keepdim=True)
-            obs_list.append(torque_magnitude)
-        
-        return torch.cat(obs_list, dim=-1) if obs_list else self._external_torque_estimate
+        if obs_list:
+            return torch.cat(obs_list, dim=-1)
+        else:
+            # Return zero observation if no sensors
+            return torch.zeros((self._env.num_envs, 1), device=self._env.device)
 
 
-class JointStateObsTerm(ObservationTerm):
-    """Basic joint state observations for impedance control."""
+@configclass
+class JointEffortObsTermCfg(ObservationTermCfg):
+    """Configuration for joint effort observation term."""
     
-    def __init__(self, cfg: "JointStateObsTermCfg", env: "ManagerBasedEnv"):
+    class_type: type[ObservationTerm] = "JointEffortObsTerm"
+    
+    # Asset configuration
+    asset_name: str = "robot"
+    """Name of the robot asset."""
+    
+    joint_names: list[str] = ["Servo1", "Servo2"]
+    """Names of joints to observe efforts for."""
+    
+    # Effort normalization
+    max_expected_effort: float = 100.0
+    """Maximum expected joint effort for normalization [N⋅m]."""
+
+
+class JointEffortObsTerm(ObservationTerm):
+    """Observation term for joint efforts/torques.
+    
+    Provides the RL agent with current joint efforts, which can indicate
+    interaction forces and impedance control performance.
+    """
+    
+    cfg: JointEffortObsTermCfg
+    
+    def __init__(self, cfg: JointEffortObsTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         
         # Get robot asset
-        self._asset = env.scene[cfg.asset_name]
+        self._asset: Articulation = env.scene[cfg.asset_name]
         
         # Get joint indices
-        if cfg.joint_names is not None:
-            self._joint_ids, _ = self._asset.find_joints(cfg.joint_names)
-        else:
-            self._joint_ids = slice(None)
+        self._joint_ids = []
+        for joint_name in cfg.joint_names:
+            joint_idx, _ = self._asset.find_joints(joint_name)
+            self._joint_ids.extend(joint_idx)
     
     @property
     def data(self) -> torch.Tensor:
-        """Returns normalized joint positions and velocities."""
-        obs_list = []
+        """
+        Returns joint effort observations.
+        """
+        # Get joint efforts for controlled joints
+        joint_efforts = self._asset.data.applied_torque[:, self._joint_ids]
         
-        # Get joint states
-        joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
+        # Normalize efforts
+        efforts_normalized = joint_efforts / self.cfg.max_expected_effort
         
-        # Normalize joint positions to [-1, 1] based on limits
-        if self.cfg.normalize_positions:
-            joint_limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
-            joint_lower = joint_limits[..., 0]
-            joint_upper = joint_limits[..., 1]
-            # Avoid division by zero
-            joint_range = joint_upper - joint_lower
-            joint_range = torch.where(joint_range > 1e-6, joint_range, torch.ones_like(joint_range))
-            joint_pos_normalized = 2.0 * (joint_pos - joint_lower) / joint_range - 1.0
-            obs_list.append(joint_pos_normalized)
-        else:
-            obs_list.append(joint_pos)
-        
-        # Add joint velocities (optionally normalized)
-        if self.cfg.velocity_normalization is not None:
-            joint_vel_normalized = torch.clamp(
-                joint_vel / self.cfg.velocity_normalization, -1.0, 1.0
-            )
-            obs_list.append(joint_vel_normalized)
-        else:
-            obs_list.append(joint_vel)
-        
-        return torch.cat(obs_list, dim=-1)
+        return efforts_normalized
 
 
 @configclass
-class ImpedanceStateObsTermCfg(ObservationTermCfg):
-    """Configuration for impedance state observations."""
+class TargetDistanceObsTermCfg(ObservationTermCfg):
+    """Configuration for target distance observation term."""
     
-    func = ImpedanceStateObsTerm
+    class_type: type[ObservationTerm] = "TargetDistanceObsTerm"
     
-    # Asset and action term references
+    # Asset configuration
     asset_name: str = "robot"
-    action_term_name: str = "variable_impedance"
+    """Name of the robot asset."""
     
-    # What to include in observations
-    include_position_error: bool = True
-    include_velocity_error: bool = True
-    include_stiffness: bool = True
-    include_damping: bool = True
-    include_joint_torques: bool = False
+    action_term_name: str = "impedance_action"
+    """Name of the variable impedance action term."""
     
-    # Normalization parameters 
-    stiffness_min: float = 10.0
-    stiffness_max: float = 5000.0
-    damping_min: float = 0.1
-    damping_max: float = 100.0
-    
-    # Torque normalization (if including torques)
-    torque_normalization: float | None = 50.0
+    joint_names: list[str] = ["Servo1", "Servo2"]
+    """Names of joints to compute distance for."""
 
 
-@configclass
-class ExternalForceObsTermCfg(ObservationTermCfg):
-    """Configuration for external force estimation observations."""
+class TargetDistanceObsTerm(ObservationTerm):
+    """Observation term for distance to target positions.
     
-    func = ExternalForceObsTerm
+    Provides the RL agent with information about how close the robot
+    is to its target positions.
+    """
     
-    # Asset settings
-    asset_name: str = "robot"
-    joint_names: list[str] | None = None
+    cfg: TargetDistanceObsTermCfg
     
-    # Observer parameters
-    observer_gain: float = 10.0
-    cutoff_freq: float = 20.0  # Hz
-    estimated_inertia: float = 0.1  # kg⋅m²
+    def __init__(self, cfg: TargetDistanceObsTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        
+        # Get robot asset
+        self._asset: Articulation = env.scene[cfg.asset_name]
+        
+        # Get action term
+        self._action_term = env.action_manager._terms[cfg.action_term_name]
+        
+        # Get joint indices
+        self._joint_ids = []
+        for joint_name in cfg.joint_names:
+            joint_idx, _ = self._asset.find_joints(joint_name)
+            self._joint_ids.extend(joint_idx)
     
-    # What to include
-    include_raw_estimates: bool = True
-    include_filtered_estimates: bool = True
-
-
-@configclass
-class JointStateObsTermCfg(ObservationTermCfg):
-    """Configuration for joint state observations."""
-    
-    func = JointStateObsTerm
-    
-    # Asset settings
-    asset_name: str = "robot"
-    joint_names: list[str] | None = None
-    
-    # Normalization settings
-    normalize_positions: bool = True
-    velocity_normalization: float | None = 5.0  # rad/s
+    @property
+    def data(self) -> torch.Tensor:
+        """
+        Returns target distance observations.
+        """
+        # Get current and desired positions
+        current_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        desired_pos = self._action_term.desired_joint_positions
+        
+        # Compute distance to target
+        position_error = desired_pos - current_pos
+        distance_to_target = torch.norm(position_error, dim=-1, keepdim=True)
+        
+        return distance_to_target
