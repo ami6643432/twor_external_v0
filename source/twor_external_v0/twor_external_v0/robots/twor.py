@@ -28,16 +28,16 @@ TWOR_CONFIG = ArticulationCfg(
         "servo1_act": ImplicitActuatorCfg(
             joint_names_expr=["Servo1"],
             effort_limit_sim=1000.0,
-            velocity_limit_sim=1000.0,
-            stiffness=100000.0,
-            damping=3000.0,
+            velocity_limit_sim=10.0,
+            stiffness=100.0,
+            damping=30.0,
         ),
         "servo2_act": ImplicitActuatorCfg(
             joint_names_expr=["Servo2"],
             effort_limit_sim=1000.0,
-            velocity_limit_sim=1000.0,
-            stiffness=100000.0,
-            damping=3000.0,
+            velocity_limit_sim=10.0,
+            stiffness=100.0,
+            damping=30.0,
         ),
         "clamp_act": ImplicitActuatorCfg(
             joint_names_expr=["Clamp"],
