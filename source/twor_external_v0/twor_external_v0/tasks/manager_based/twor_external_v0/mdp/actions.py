@@ -1,210 +1,262 @@
-"""Action terms for learned impedance control with planned trajectories."""
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Variable impedance action terms for the MDP."""
 
 from __future__ import annotations
 
 import torch
 from typing import TYPE_CHECKING
 
-from omni.isaac.lab.utils import configclass
-from omni.isaac.lab.managers.action_manager import ActionTerm, ActionTermCfg
-from omni.isaac.lab.assets import Articulation
+from isaaclab.assets import Articulation
+from isaaclab.managers import ActionTerm, ActionTermCfg
+from isaaclab.utils import configclass
 
 if TYPE_CHECKING:
-    from omni.isaac.lab.envs import ManagerBasedEnv
+    from isaaclab.envs import ManagerBasedRLEnv
 
 
-class LearnedImpedanceActionTerm(ActionTerm):
-    """
-    Action term that applies impedance control with learned stiffness and damping.
-    Position targets come from a trajectory planner, not from RL actions.
-    """
+class VariableImpedanceActionTerm(ActionTerm):
+    """Variable impedance action term that combines position tracking with learned impedance parameters.
     
-    cfg: LearnedImpedanceActionTermCfg
-    _asset: Articulation
-    
-    def __init__(self, cfg: LearnedImpedanceActionTermCfg, env: ManagerBasedEnv):
+    This action term:
+    - Receives joint position commands from an external planner
+    - Uses RL agent outputs for stiffness and damping parameters
+    - Applies impedance control law: τ = K*(q_des - q) + D*(q̇_des - q̇)
+    - Ensures stability through positive definiteness constraints
+    """
+
+    cfg: VariableImpedanceActionTermCfg
+    """Configuration for the action term."""
+
+    def __init__(self, cfg: VariableImpedanceActionTermCfg, env: ManagerBasedRLEnv) -> None:
+        """Initialize the variable impedance action term.
+
+        Args:
+            cfg: Configuration for the action term.
+            env: The environment object.
+        """
+        # Initialize the base class
         super().__init__(cfg, env)
+
+        # Store the articulation asset
+        self._asset: Articulation = env.scene[cfg.asset_name]
         
-        # Get the robot asset
-        self._asset = env.scene[cfg.asset_name]
+        # Find the controlled joint indices (only Servo1 and Servo2)
+        if cfg.joint_names is None:
+            self._joint_ids = slice(None)
+            self._num_joints = self._asset.num_joints
+        else:
+            self._joint_ids, _ = self._asset.find_joints(cfg.joint_names)
+            self._num_joints = len(self._joint_ids)
         
-        # Get joint indices for impedance control
-        self._joint_ids, self._joint_names = self._asset.find_joints(cfg.joint_names)
-        self._num_joints = len(self._joint_ids)
+        # Expected action dimension: [K1, D1, K2, D2] for 2 joints
+        expected_action_dim = 2 * self._num_joints  # stiffness + damping for each joint
+        if self.action_dim != expected_action_dim:
+            raise ValueError(
+                f"Expected action dimension {expected_action_dim} for {self._num_joints} joints, "
+                f"got {self.action_dim}"
+            )
+
+        # Initialize impedance parameter bounds
+        self._stiffness_min = torch.tensor(cfg.stiffness_min, device=self._env.device)
+        self._stiffness_max = torch.tensor(cfg.stiffness_max, device=self._env.device)
+        self._damping_min = torch.tensor(cfg.damping_min, device=self._env.device)
+        self._damping_max = torch.tensor(cfg.damping_max, device=self._env.device)
         
-        # Initialize trajectory planner
-        self._trajectory_planner = self._create_trajectory_planner(cfg.planner_cfg)
-        
-        # Storage for current targets and parameters
-        self._position_targets = torch.zeros(env.num_envs, self._num_joints, device=env.device)
-        self._velocity_targets = torch.zeros(env.num_envs, self._num_joints, device=env.device)
-        self._stiffness = torch.zeros(env.num_envs, self._num_joints, device=env.device)
-        self._damping = torch.zeros(env.num_envs, self._num_joints, device=env.device)
+        # Ensure bounds are broadcastable to joint dimensions
+        if self._stiffness_min.numel() == 1:
+            self._stiffness_min = self._stiffness_min.repeat(self._num_joints)
+        if self._stiffness_max.numel() == 1:
+            self._stiffness_max = self._stiffness_max.repeat(self._num_joints)
+        if self._damping_min.numel() == 1:
+            self._damping_min = self._damping_min.repeat(self._num_joints)
+        if self._damping_max.numel() == 1:
+            self._damping_max = self._damping_max.repeat(self._num_joints)
+
+        # State variables for tracking
+        self._desired_pos = torch.zeros(self._env.num_envs, self._num_joints, device=self._env.device)
+        self._desired_vel = torch.zeros(self._env.num_envs, self._num_joints, device=self._env.device)
+        self._processed_stiffness = torch.zeros(self._env.num_envs, self._num_joints, device=self._env.device)
+        self._processed_damping = torch.zeros(self._env.num_envs, self._num_joints, device=self._env.device)
         
         # Initialize with default values
-        self.reset()
-    
-    def _create_trajectory_planner(self, planner_cfg):
-        """Create the trajectory planner based on configuration."""
-        if planner_cfg.type == "sinusoidal":
-            return SinusoidalPlanner(
-                num_envs=self._env.num_envs,
-                num_joints=self._num_joints,
-                device=self._env.device,
-                frequency=planner_cfg.frequency,
-                amplitude=planner_cfg.amplitude,
-                phase_offset=planner_cfg.phase_offset,
-            )
-        elif planner_cfg.type == "waypoint":
-            return WaypointPlanner(
-                num_envs=self._env.num_envs,
-                num_joints=self._num_joints,
-                device=self._env.device,
-                waypoints=planner_cfg.waypoints,
-                interpolation_time=planner_cfg.interpolation_time,
-            )
-        else:
-            raise ValueError(f"Unknown planner type: {planner_cfg.type}")
-    
-    @property
-    def action_dim(self) -> int:
-        """Dimension of the action term: stiffness + damping for each controlled joint."""
-        return self._num_joints * 2  # Only stiffness and damping
-    
-    def process_actions(self, actions: torch.Tensor):
-        """Process raw actions into stiffness and damping parameters."""
-        # Split actions into stiffness and damping
-        stiffness_raw = actions[:, :self._num_joints]
-        damping_raw = actions[:, self._num_joints:2*self._num_joints]
+        self._processed_stiffness[:] = cfg.default_stiffness
+        self._processed_damping[:] = cfg.default_damping
+
+        # External planner interface
+        self._planner_interface = None  # Will be set by environment if needed
         
-        # Process stiffness (ensure positive and within bounds)
-        self._stiffness = (
-            torch.sigmoid(stiffness_raw) * 
-            (self.cfg.stiffness_max - self.cfg.stiffness_min) + 
-            self.cfg.stiffness_min
+        # Stability monitoring
+        self._stability_margin = cfg.stability_margin
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        """Process the raw actions from the RL agent.
+
+        Args:
+            actions: Raw actions from agent [batch_size, action_dim]
+                    Format: [K1, D1, K2, D2, ...] for each joint
+        """
+        # Reshape actions: [batch_size, num_joints, 2] where last dim is [K, D]
+        actions_reshaped = actions.view(self._env.num_envs, self._num_joints, 2)
+        
+        # Extract stiffness and damping
+        raw_stiffness = actions_reshaped[..., 0]  # [batch_size, num_joints]
+        raw_damping = actions_reshaped[..., 1]    # [batch_size, num_joints]
+        
+        # Apply bounds and ensure positive definiteness
+        self._processed_stiffness = torch.clamp(
+            raw_stiffness, 
+            min=self._stiffness_min, 
+            max=self._stiffness_max
         )
         
-        # Process damping (ensure stability)
-        if self.cfg.auto_compute_damping:
-            # Critical damping: d = 2 * sqrt(k * m), assuming m=1 for simplicity
-            self._damping = 2 * torch.sqrt(self._stiffness) * self.cfg.damping_ratio
-        else:
-            # Ensure damping is within stable bounds
-            damping_min = self.cfg.damping_ratio_min * 2 * torch.sqrt(self._stiffness)
-            damping_max = self.cfg.damping_ratio_max * 2 * torch.sqrt(self._stiffness)
-            self._damping = (
-                torch.sigmoid(damping_raw) * (damping_max - damping_min) + damping_min
+        self._processed_damping = torch.clamp(
+            raw_damping,
+            min=self._damping_min,
+            max=self._damping_max
+        )
+        
+        # Ensure stability: D² < 4*M*K (for second-order systems)
+        # Using estimated inertia or conservative bound
+        if self.cfg.enforce_stability:
+            max_stable_damping = 2.0 * torch.sqrt(self.cfg.estimated_inertia * self._processed_stiffness)
+            self._processed_damping = torch.min(
+                self._processed_damping,
+                max_stable_damping * self._stability_margin
             )
-    
-    def apply_actions(self):
-        """Apply impedance control with learned parameters and planned trajectories."""
+
+    def apply_actions(self) -> None:
+        """Apply the impedance control law to compute joint torques."""
         # Get current joint states
-        joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
+        current_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        current_vel = self._asset.data.joint_vel[:, self._joint_ids]
         
-        # Update trajectory planner and get targets
-        current_time = self._env.episode_length_buf * self._env.step_dt
-        self._position_targets, self._velocity_targets = self._trajectory_planner.compute_targets(
-            current_time, joint_pos
-        )
+        # Get desired positions from planner (if available) or use current as default
+        if self._planner_interface is not None:
+            self._desired_pos = self._planner_interface.get_desired_positions()
+            self._desired_vel = self._planner_interface.get_desired_velocities()
+        else:
+            # For now, use current position as desired (can be overridden by environment)
+            if torch.allclose(self._desired_pos, torch.zeros_like(self._desired_pos)):
+                self._desired_pos = current_pos.clone()
+            # Desired velocity is zero for position holding
+            self._desired_vel.zero_()
         
         # Compute position and velocity errors
-        pos_error = self._position_targets - joint_pos
-        vel_error = self._velocity_targets - joint_vel
+        pos_error = self._desired_pos - current_pos
+        vel_error = self._desired_vel - current_vel
         
-        # Compute impedance control torques: tau = kp * e_pos + kd * e_vel
-        torques = self._stiffness * pos_error + self._damping * vel_error
+        # Apply impedance control law: τ = K*(q_des - q) + D*(q̇_des - q̇)
+        stiffness_torque = self._processed_stiffness * pos_error
+        damping_torque = self._processed_damping * vel_error
+        total_torque = stiffness_torque + damping_torque
         
-        # Optionally add gravity compensation
-        if self.cfg.gravity_compensation:
-            gravity = self._asset.data.generalized_gravity[:, self._joint_ids]
-            torques += gravity
-        
-        # Apply torque limits
+        # Apply torque limits for safety
         if self.cfg.torque_limit is not None:
-            torques = torch.clamp(torques, -self.cfg.torque_limit, self.cfg.torque_limit)
+            torque_limit = torch.tensor(self.cfg.torque_limit, device=self._env.device)
+            if torque_limit.numel() == 1:
+                torque_limit = torque_limit.repeat(self._num_joints)
+            total_torque = torch.clamp(total_torque, -torque_limit, torque_limit)
         
-        # Set the computed torques
-        self._asset.set_joint_effort_target(torques, joint_ids=self._joint_ids)
-    
-    def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        """Reset the action term."""
-        if env_ids is None:
-            env_ids = torch.arange(self._env.num_envs, device=self._env.device)
-        
-        # Reset to default impedance values
-        self._stiffness[env_ids] = self.cfg.stiffness_init
-        self._damping[env_ids] = 2 * torch.sqrt(self.cfg.stiffness_init) * self.cfg.damping_ratio
-        
-        # Reset trajectory planner
-        self._trajectory_planner.reset(env_ids)
+        # Set the computed torques to the asset
+        self._asset.set_joint_effort_target(total_torque, joint_ids=self._joint_ids)
 
+    def set_desired_position(self, desired_pos: torch.Tensor, desired_vel: torch.Tensor | None = None) -> None:
+        """Set desired position and velocity from external planner.
+        
+        Args:
+            desired_pos: Desired joint positions [batch_size, num_joints]
+            desired_vel: Desired joint velocities [batch_size, num_joints], defaults to zero
+        """
+        self._desired_pos = desired_pos.clone()
+        if desired_vel is not None:
+            self._desired_vel = desired_vel.clone()
+        else:
+            self._desired_vel.zero_()
 
-class SinusoidalPlanner:
-    """Simple sinusoidal trajectory planner for testing."""
-    
-    def __init__(self, num_envs, num_joints, device, frequency, amplitude, phase_offset):
-        self.num_envs = num_envs
-        self.num_joints = num_joints
-        self.device = device
-        self.frequency = torch.tensor(frequency, device=device)
-        self.amplitude = torch.tensor(amplitude, device=device)
-        self.phase_offset = torch.tensor(phase_offset, device=device)
-        self.initial_pos = torch.zeros(num_envs, num_joints, device=device)
-    
-    def compute_targets(self, time, current_pos):
-        """Compute position and velocity targets."""
-        # Simple sinusoidal motion around initial position
-        pos_targets = self.initial_pos + self.amplitude * torch.sin(
-            2 * torch.pi * self.frequency * time.unsqueeze(-1) + self.phase_offset
-        )
-        vel_targets = self.amplitude * 2 * torch.pi * self.frequency * torch.cos(
-            2 * torch.pi * self.frequency * time.unsqueeze(-1) + self.phase_offset
-        )
-        return pos_targets, vel_targets
-    
-    def reset(self, env_ids):
-        """Reset planner for specified environments."""
-        # Store initial position as reference
-        pass  # Will be set when first called
+    def reset(self, env_ids: torch.Tensor) -> None:
+        """Reset the action term for specified environment IDs.
+        
+        Args:
+            env_ids: Environment IDs to reset.
+        """
+        # Reset to default impedance parameters
+        self._processed_stiffness[env_ids] = self.cfg.default_stiffness
+        self._processed_damping[env_ids] = self.cfg.default_damping
+        
+        # Reset desired positions to current positions
+        current_pos = self._asset.data.joint_pos[env_ids, self._joint_ids]
+        self._desired_pos[env_ids] = current_pos
+        self._desired_vel[env_ids] = 0.0
+
+    @property
+    def current_stiffness(self) -> torch.Tensor:
+        """Get current stiffness parameters."""
+        return self._processed_stiffness.clone()
+
+    @property
+    def current_damping(self) -> torch.Tensor:
+        """Get current damping parameters."""
+        return self._processed_damping.clone()
+
+    @property
+    def desired_positions(self) -> torch.Tensor:
+        """Get current desired positions."""
+        return self._desired_pos.clone()
+
+    @property
+    def control_errors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get current position and velocity errors."""
+        current_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        current_vel = self._asset.data.joint_vel[:, self._joint_ids]
+        pos_error = self._desired_pos - current_pos
+        vel_error = self._desired_vel - current_vel
+        return pos_error, vel_error
 
 
 @configclass
-class LearnedImpedanceActionTermCfg(ActionTermCfg):
-    """Configuration for learned impedance action term."""
+class VariableImpedanceActionTermCfg(ActionTermCfg):
+    """Configuration for variable impedance action term."""
+
+    class_type: type[ActionTerm] = VariableImpedanceActionTerm
+    """Class type for the action term."""
+
+    # Joint specification
+    joint_names: list[str] | None = None
+    """Names of joints to control. If None, all joints are controlled."""
+
+    # Impedance parameter bounds
+    stiffness_min: float | list[float] = 10.0
+    """Minimum stiffness value(s) [N⋅m/rad]."""
     
-    class_type: type[ActionTerm] = LearnedImpedanceActionTerm
+    stiffness_max: float | list[float] = 5000.0
+    """Maximum stiffness value(s) [N⋅m/rad]."""
     
-    # Asset settings
-    asset_name: str = "robot"
-    joint_names: list[str] = ["Servo1", "Servo2"]  # Only control these joints
+    damping_min: float | list[float] = 0.1
+    """Minimum damping value(s) [N⋅m⋅s/rad]."""
     
-    # Impedance bounds
-    stiffness_min: float = 10.0
-    stiffness_max: float = 300.0
-    stiffness_init: float = 100.0
+    damping_max: float | list[float] = 100.0
+    """Maximum damping value(s) [N⋅m⋅s/rad]."""
+
+    # Default values
+    default_stiffness: float | list[float] = 1000.0
+    """Default stiffness value(s) [N⋅m/rad]."""
     
-    # Damping settings
-    auto_compute_damping: bool = True  # If True, compute damping from stiffness
-    damping_ratio: float = 1.0  # For auto-computed damping (1.0 = critical)
-    damping_ratio_min: float = 0.3  # For learned damping
-    damping_ratio_max: float = 2.0  # For learned damping
+    default_damping: float | list[float] = 20.0
+    """Default damping value(s) [N⋅m⋅s/rad]."""
+
+    # Safety and stability
+    torque_limit: float | list[float] | None = None
+    """Maximum torque output [N⋅m]. If None, no limit is applied."""
     
-    # Control settings
-    gravity_compensation: bool = True
-    torque_limit: float | None = None  # Set to limit maximum torques
+    enforce_stability: bool = True
+    """Whether to enforce stability constraints on damping."""
     
-    # Trajectory planner configuration
-    @configclass
-    class PlannerCfg:
-        """Configuration for trajectory planner."""
-        type: str = "sinusoidal"  # "sinusoidal", "waypoint", etc.
-        # Sinusoidal planner params
-        frequency: list[float] = [0.5, 0.3]  # Hz for each joint
-        amplitude: list[float] = [0.3, 0.2]  # Radians
-        phase_offset: list[float] = [0.0, 1.57]  # Phase offset
-        # Waypoint planner params (if used)
-        waypoints: list[list[float]] | None = None
-        interpolation_time: float = 2.0
+    estimated_inertia: float | list[float] = 0.1
+    """Estimated joint inertia for stability calculations [kg⋅m²]."""
     
-    planner_cfg: PlannerCfg = PlannerCfg()
+    stability_margin: float = 0.8
+    """Safety margin for stability constraint (< 1.0)."""
