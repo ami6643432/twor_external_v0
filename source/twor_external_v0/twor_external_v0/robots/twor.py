@@ -6,7 +6,7 @@ import numpy as np
 
 TWOR_CONFIG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"/home/amitabh/twor_external_v0/source/twor_external_v0/twor_external_v0/robots/usd/twor/urdf/Arm/arm_home_v1.usd",
+        usd_path=f"d:/twor_external_v0/source/twor_external_v0/twor_external_v0/robots/usd/twor/urdf/Arm/Arm.usd",
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=5.0,
