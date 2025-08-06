@@ -51,7 +51,7 @@ class TworExternalV0EnvCfg(DirectRLEnvCfg):
         spawn=TWOR_CONFIG.spawn.replace(activate_contact_sensors=True)
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1000, env_spacing=2.0, replicate_physics=True
+        num_envs=1, env_spacing=2.0, replicate_physics=True #Increase the num_envs later
     )
 
     # -------------------------------------------------------------------------
