@@ -25,31 +25,37 @@ from . import mdp
 ##
 # Pre-defined configs
 ##
-from twor_external_v0.robots.twor import TWOR_CONFIG
+
+# Import TWOR configuration - CORRECTED PATH
+from twor_external_v0.robots.twor import TWOR_CONFIG  # isort:skip
+
 
 ##
 # Scene definition
 ##
 
+
 @configclass
 class TworExternalV0SceneCfg(InteractiveSceneCfg):
     """Configuration for TwoR variable impedance control scene."""
 
-    # Ground plane - exactly as in working example
-    ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
+    # ground plane
+    ground = AssetBaseCfg(
+        prim_path="/World/defaultGroundPlane",
+        spawn=sim_utils.GroundPlaneCfg()
+    )
 
-    # lights - exactly as in working example  
+    # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/Light", 
         spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
 
-    # robot - keep scene entity name "robot" but set prim_path to "Twor" (matches direct workflow USD structure)
-    # This aligns with direct env where sensor is attached to Link2 under the Twor prim.
+    # robot - Use consistent naming with test script
     robot: ArticulationCfg = TWOR_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Twor")
 
-    # Cube object - exactly as in working add_new_robot.py
-    cube = RigidObjectCfg(
+    # Cube object - Match the working example exactly
+    Cube = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Cube",
         spawn=sim_utils.CuboidCfg(
             size=(0.25, 0.25, 0.25),
@@ -62,30 +68,32 @@ class TworExternalV0SceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.3, 0, 0.25)),
     )
 
-    # Contact sensor - align with direct workflow (attached to Link2 end-effector)
-    # In direct env: prim_path="/World/envs/env_.*/Twor/Link2" stored as contact_L2. We keep the scene key
-    # "contact_sensor" for consistency with manager-based observation/reward configuration.
+    # Contact sensor - EXACTLY as in working add_new_robot.py
     contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Twor/Link2",     # End-effector link for force sensing
-        update_period=0.0,                          # every physics step
-        history_length=1,                           # only latest contact
-        debug_vis=False,                            # disable visualization (set True to debug)
+        prim_path="{ENV_REGEX_NS}/Twor/Sensor",   # Use Sensor, not Link2
+        update_period=0.0,                       # every physics step
+        history_length=1,                        # only latest contact
+        debug_vis=False,                         # visualize contact forces
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube"],  # only collisions with Cube
     )
+
 
 ##
 # MDP settings
 ##
 
+
 @configclass
 class ActionsCfg:
     """Action specifications for the MDP."""
 
+    # Use joint effort action to match test script behavior
     joint_effort = mdp.JointEffortActionCfg(
-        asset_name="robot",  # This must match the scene entity name
-        joint_names=["Servo1", "Servo2", "Clamp"],  # From URDF
+        asset_name="robot",  # Match the scene entity name
+        joint_names=["Servo1", "Servo2", "Clamp"],
         scale=100.0
     )
+
 
 @configclass
 class ObservationsCfg:
@@ -95,11 +103,13 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
+        # Joint positions and velocities
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        # Contact force magnitude (functional helper returns [B,1])
-        contact_force_mag = ObsTerm(
-            func=mdp.contact_force_norm,
+        
+        # Contact forces from sensor
+        contact_forces = ObsTerm(
+            func=mdp.contact_forces,
             params={"sensor_cfg": SceneEntityCfg("contact_sensor")},
         )
 
@@ -107,63 +117,77 @@ class ObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    # observation groups
     policy: PolicyCfg = PolicyCfg()
+
 
 @configclass
 class EventCfg:
     """Configuration for events."""
 
+    # startup
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
 
+    # reset robot position
     reset_robot_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-3.14, 3.14)},
             "velocity_range": {},
-            "asset_cfg": SceneEntityCfg("robot"),  # Must match scene entity name
+            "asset_cfg": SceneEntityCfg("robot"),
         },
     )
+
 
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # Simple contact force magnitude reward (penalize large force by negative weight if desired)
+    # Contact reward
     contact_reward = RewTerm(
-        func=mdp.contact_force_norm,
+        func=mdp.contact_forces,
         weight=0.01,
         params={"sensor_cfg": SceneEntityCfg("contact_sensor")},
     )
+
 
 @configclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
+    # Episode timeout
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+
 
 ##
 # Environment configuration
 ##
 
+
 @configclass
 class TworExternalV0EnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for TwoR Variable Impedance Control RL Environment."""
 
-    scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=4096, env_spacing=2.0)  # match add_new_robot.py
+    # Scene settings
+    scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=4096, env_spacing=4.0)
+    
+    # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
+    
+    # MDP settings
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
 
     def __post_init__(self) -> None:
         """Post initialization."""
+        # general settings
         self.decimation = 2
         self.episode_length_s = 5
-        # Camera similar to add_new_robot.py (eye only)
-        self.viewer.eye = (0.0, 3.5, 3.2)  # now from +Y instead of +X
-        self.viewer.lookat = (0.0, 0.0, 0.5)  # aim toward scene center
-
+        # viewer settings
+        self.viewer.eye = (8.0, 0.0, 5.0)
+        # simulation settings
         self.sim.dt = 1 / 120
         self.sim.render_interval = self.decimation
