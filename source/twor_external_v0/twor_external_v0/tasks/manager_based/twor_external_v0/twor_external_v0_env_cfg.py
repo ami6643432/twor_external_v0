@@ -115,26 +115,16 @@ class EventCfg:
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
 
-    reset_robot_position = EventTerm(
-        func=mdp.reset_root_state_uniform,
-        mode="reset",
-        params={
-            "pose_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-3.14, 3.14)},
-            "velocity_range": {},
-            "asset_cfg": SceneEntityCfg("robot"),  # Must match scene entity name
-        },
-    )
-
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # Simple contact force magnitude reward (penalize large force by negative weight if desired)
     contact_reward = RewTerm(
-        func=mdp.contact_force_norm,
+        func=mdp.contact_force_magnitude,
         weight=0.01,
         params={"sensor_cfg": SceneEntityCfg("contact_sensor")},
     )
+
 
 @configclass
 class TerminationsCfg:
@@ -152,7 +142,8 @@ class TworExternalV0EnvCfg(ManagerBasedRLEnvCfg):
 
     scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=4096, env_spacing=2.0)  # match add_new_robot.py
     observations: ObservationsCfg = ObservationsCfg()
-    actions: ActionsCfg = ActionsCfg()
+    # actions: ActionsCfg = ActionsCfg()
+    commands: CommandsCfg = CommandsCfg()
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
@@ -162,7 +153,7 @@ class TworExternalV0EnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 2
         self.episode_length_s = 5
         # Camera similar to add_new_robot.py (eye only)
-        self.viewer.eye = (0.0, 3.5, 3.2)  # now from +Y instead of +X
+        self.viewer.eye = (0.0, 3.5, 1)  # now from +Y instead of +X
         self.viewer.lookat = (0.0, 0.0, 0.5)  # aim toward scene center
 
         self.sim.dt = 1 / 120
