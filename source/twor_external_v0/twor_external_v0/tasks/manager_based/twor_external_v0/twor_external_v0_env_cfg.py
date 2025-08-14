@@ -14,6 +14,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import CommandTermCfg as CommandTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
@@ -26,6 +27,7 @@ from . import mdp
 # Pre-defined configs
 ##
 from twor_external_v0.robots.twor import TWOR_CONFIG
+from twor_external_v0.robots.twor_min import TWOR_MIN_CONFIG
 
 ##
 # Scene definition
@@ -48,18 +50,22 @@ class TworExternalV0SceneCfg(InteractiveSceneCfg):
     # This aligns with direct env where sensor is attached to Link2 under the Twor prim.
     robot: ArticulationCfg = TWOR_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Twor")
 
+    # robot_min - keep scene entity name "robot_min" but set prim_path to "Twor_min" (matches direct workflow USD structure)
+    # This aligns with direct env where sensor is attached to Link2 under the Twor_min
+    # robot_min: ArticulationCfg = TWOR_MIN_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Twor_min")
+
     # Cube object - exactly as in working add_new_robot.py
     cube = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Cube",
         spawn=sim_utils.CuboidCfg(
             size=(0.25, 0.25, 0.25),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            mass_props=sim_utils.MassPropertiesCfg(mass=40.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.3, 0, 0.25)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.3, -0.5, 0.25)),
     )
 
     # Contact sensor - align with direct workflow (attached to Link2 end-effector)
@@ -67,6 +73,7 @@ class TworExternalV0SceneCfg(InteractiveSceneCfg):
     # "contact_sensor" for consistency with manager-based observation/reward configuration.
     contact_sensor = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Twor/Link2",     # End-effector link for force sensing
+        # prim_path="{ENV_REGEX_NS}/Twor_min/Link2",     # End-effector link for force sensing
         update_period=0.0,                          # every physics step
         history_length=1,                           # only latest contact
         debug_vis=False,                            # disable visualization (set True to debug)
@@ -84,8 +91,14 @@ class ActionsCfg:
     joint_effort = mdp.JointEffortActionCfg(
         asset_name="robot",  # This must match the scene entity name
         joint_names=["Servo1", "Servo2", "Clamp"],  # From URDF
-        scale=100.0
+        scale=0.0
     )
+
+    # joint_effort = mdp.JointEffortActionCfg(
+    #     asset_name= "robot_min",  # This must match the scene entity name
+    #     joint_names=["Servo1", "Servo2"],  # From URDF
+    #     scale=100.0
+    # )
 
 @configclass
 class ObservationsCfg:
@@ -140,10 +153,10 @@ class TerminationsCfg:
 class TworExternalV0EnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for TwoR Variable Impedance Control RL Environment."""
 
-    scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=4096, env_spacing=2.0)  # match add_new_robot.py
+    scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=1, env_spacing=2.0)  # match add_new_robot.py
     observations: ObservationsCfg = ObservationsCfg()
-    # actions: ActionsCfg = ActionsCfg()
-    commands: CommandsCfg = CommandsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    # commands: CommandsCfg = CommandsCfg()
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()

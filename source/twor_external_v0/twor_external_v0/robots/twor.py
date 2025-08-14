@@ -22,7 +22,7 @@ TWOR_CONFIG = ArticulationCfg(
             "Servo2": np.pi / 2.0 - np.pi/8,
             "Clamp": 0.0,
         },
-        pos=(0.0, +0.5, 0.36),
+        pos=(0.0, 0.0, 0.36),
     ),
     actuators={
         "servo1_act": ImplicitActuatorCfg(
