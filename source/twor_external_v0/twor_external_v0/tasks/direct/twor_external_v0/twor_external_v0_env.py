@@ -289,7 +289,7 @@ class TworExternalV0Env(DirectRLEnv):
             self._x_des = pos_ref  # Use IK reference as the nominal trajectory
             
             # Debug logging
-            if self._count[0] % 100 == 0:  # Log every 100 steps for first env
+            if (self._count[0] - 1) % 100 == 0:  # Log every 100 steps for first env
                 env_idx = 0
                 print(f"\n--- Step {self._count[env_idx].item()} Debug Info ---")
                 print(f"EE Position (IK):      [{end_effector_pos_ik[env_idx, 0]:.4f}, {end_effector_pos_ik[env_idx, 1]:.4f}, {end_effector_pos_ik[env_idx, 2]:.4f}] m")
@@ -330,11 +330,15 @@ class TworExternalV0Env(DirectRLEnv):
             self._use_fallback_trajectory()
 
         # Update impedance filter to get modified reference
-        x_ref = self.impedance_filter.update(tau_ext, self._x_des)
+        tau_ext = tau_ext.clamp(-5.0, 5.0)
+        x_ref = self.impedance_filter.update(-tau_ext, self._x_des)
         
         # Apply reference as joint position targets
         self.robot.set_joint_position_target(x_ref, joint_ids=self._joint_ids)
         self._desired_pos = x_ref.clone()
+
+        # self._desired_pos = self._x_des
+
 
     def _generate_new_trajectory(self):
         """Generate new trajectory based on configuration."""
@@ -432,74 +436,92 @@ class TworExternalV0Env(DirectRLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         """
-        MAIN RESET METHOD - Reset specified environments for episode termination.
-        This is the ONLY place where resets should be coordinated.
+        MAIN RESET METHOD — single coordination point for episode resets.
+        Resets: articulations, rigid objects, sensors, internal buffers, controllers,
+        action buffer, and regenerates the IK trajectory.
         """
+        # 0) base class hook
         super()._reset_idx(env_ids)
+
+        # 1) normalize env_ids -> tensor on device
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
-
-        # Convert to tensor if needed
-        if not isinstance(env_ids, torch.Tensor):
+        elif not isinstance(env_ids, torch.Tensor):
             env_ids = torch.tensor(env_ids, device=self.device)
 
-        print(f"Resetting environments {env_ids.tolist()} - starting new episodes")
+        self.episode_length_buf[env_ids] = 0
+        # print(f"Resetting environments {env_ids.tolist()} - starting new episodes")
 
-        # Reset trajectory counters - this starts fresh trajectories
+        # 2) episode bookkeeping
         self._count[env_ids] = 0
-        
-        # Clear trajectory completion flags
-        if hasattr(self, '_trajectory_completed'):
-            self._trajectory_completed[env_ids] = False
+        if not hasattr(self, "_trajectory_completed"):
+            self._trajectory_completed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._trajectory_completed[env_ids] = False
+        if not hasattr(self, "_last_dist"):
+            self._last_dist = torch.zeros(self.num_envs, device=self.device)
 
-        # Reset robot state in simulation
-        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
-        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
-        self.robot.write_joint_state_to_sim(
-            position=joint_pos,
-            velocity=joint_vel,
-            env_ids=env_ids
-        )
+        # 3) reset ALL articulations (robot included): joints + (if available) root state
+        for _, art in self.scene.articulations.items():
+            jp = art.data.default_joint_pos[env_ids].clone()
+            jv = art.data.default_joint_vel[env_ids].clone()
+            art.write_joint_state_to_sim(position=jp, velocity=jv, env_ids=env_ids)
+            try:
+                root = art.data.default_root_state[env_ids].clone()   # [B, 13] usually
+                art.write_root_pose_to_sim(root[:, :7], env_ids)
+                art.write_root_velocity_to_sim(root[:, 7:], env_ids)
+            except Exception:
+                pass  # some articulations may not expose root writers
 
-        # Reset cube to initial position with proper state
-        if "Cube" in self.scene.rigid_objects:
-            cube = self.scene.rigid_objects["Cube"]
-            
-            # Get default cube state and apply to specified environments
-            cube_state = cube.data.default_root_state[env_ids].clone()
-            
-            # Set position to configured box start position
-            cube_state[:, 0] = self.cfg.box_start_pos[0]  # x
-            cube_state[:, 1] = self.cfg.box_start_pos[1]  # y  
-            cube_state[:, 2] = self.cfg.box_start_pos[2]  # z
-            
-            # Reset velocity to zero
-            cube_state[:, 7:] = 0.0  # linear and angular velocities
-            
-            # Apply the reset state
-            cube.write_root_pose_to_sim(cube_state[:, :7], env_ids)
-            cube.write_root_velocity_to_sim(cube_state[:, 7:], env_ids)
-            
-            print(f"Reset cube position to: [{self.cfg.box_start_pos[0]:.3f}, {self.cfg.box_start_pos[1]:.3f}, {self.cfg.box_start_pos[2]:.3f}]")
+        # 4) reset ALL rigid objects to their default root state
+        for _, obj in self.scene.rigid_objects.items():
+            try:
+                rs = obj.data.default_root_state[env_ids].clone()
+                obj.write_root_pose_to_sim(rs[:, :7], env_ids)
+                obj.write_root_velocity_to_sim(rs[:, 7:], env_ids)
+            except Exception:
+                pass
 
-        # Reset internal state buffers
+        # 5) reset sensors if they implement reset()
+        for _, sensor in self.scene.sensors.items():
+            if hasattr(sensor, "reset"):
+                try:
+                    # prefer per-env reset if supported
+                    sensor.reset(env_ids)
+                except TypeError:
+                    try:
+                        sensor.reset()
+                    except Exception:
+                        pass
+
+        # 6) reset internal rolling buffers & desired references
         self._reset_internal_buffers(env_ids)
-        
-        # Reset all control components
-        self._reset_all_components(env_ids)
-        
-        # Reset progress tracking for box pushing task
-        if hasattr(self, '_last_dist'):
-            spawn_x = torch.full((len(env_ids),), self.cfg.box_start_pos[0], device=self.device)
-            target_x = spawn_x - self.cfg.target_pos_x
-            cube_x = torch.full((len(env_ids),), self.cfg.box_start_pos[0], device=self.device)
-            self._last_dist[env_ids] = torch.abs(cube_x - target_x)
+        if hasattr(self, "_x_des"):
+            idxs = self._joint_ids
+            default_q = self.robot.data.default_joint_pos[env_ids][:, idxs].clone()
+            self._x_des[env_ids] = default_q  # nominal joint-space reference
 
-        # Generate fresh trajectory for new episodes
-        self._generate_new_trajectory()
-        
-        # Force update scene to ensure sensor data is available
+        # 7) reset controllers/filters and action buffer
+        self._reset_all_components(env_ids)               # ImpedanceFilter / ImpedancePositionGenerator
+        self._actions = torch.zeros(self.num_envs, 4, device=self.device)  # [k1, d1, k2, d2]
+
+        # 8) reset & REGENERATE IK trajectory
+        if hasattr(self, "ik_trajectory_generator"):
+            try:
+                self.ik_trajectory_generator.reset()
+            except Exception:
+                pass
+            self._generate_new_trajectory()
+
+        # 9) reinitialize progress baseline for rewards (cube distance)
+        if "Cube" in self.scene.rigid_objects:
+            spawn_x_all  = self.scene.rigid_objects["Cube"].data.default_root_state[:, 0]  # [num_envs]
+            target_x_all = spawn_x_all - self.cfg.target_pos_x
+            cube_x_all   = self.scene.rigid_objects["Cube"].data.root_state_w[:, 0]
+            self._last_dist[env_ids] = (cube_x_all[env_ids] - target_x_all[env_ids]).abs()
+
+        # 10) tick once so sensors/Jacobians are valid on the next step
         self.scene.update(self.cfg.sim.dt)
+
 
     def _get_rewards(self) -> torch.Tensor:
         """
@@ -554,33 +576,32 @@ class TworExternalV0Env(DirectRLEnv):
         }
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute done and truncation masks.
-        """
-        # Time-based episode termination
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        
-        # Force violation termination
+        # 1) time-based truncation only (Gymnasium "truncated")
+        time_out = (self.episode_length_buf >= self.max_episode_length - 1)
+
+        # 2) safe contact forces -> violation
         try:
-            contact_data = self.scene.sensors["contact_L2"].data.net_forces_w
-            if contact_data.dim() == 3:
-                forces = contact_data.squeeze(1)  # [B, N, 3] -> [B, 3]
-            elif contact_data.dim() == 2:
-                forces = contact_data  # Already [B, 3]
-            else:
+            contact = self.scene.sensors["contact_L2"].data.net_forces_w
+            if contact is None or contact.numel() == 0:
                 forces = torch.zeros(self.num_envs, 3, device=self.device)
-        except (AttributeError, RuntimeError):
+            elif contact.dim() == 3:                 # [B, N, 3]
+                forces = contact.sum(dim=1)          # -> [B, 3]
+            else:                                    # [B, 3]
+                forces = contact
+        except Exception:
             forces = torch.zeros(self.num_envs, 3, device=self.device)
-        
-        force_violation = torch.norm(forces, dim=-1) > self.cfg.max_allowed_force
-        
-        # Trajectory completion termination (NEW)
-        trajectory_completed = getattr(self, '_trajectory_completed', torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
-        
-        # Episode ends on: timeout, force violation, OR trajectory completion
-        done = time_out | force_violation | trajectory_completed
-        
-        return done, time_out
+        forces = torch.nan_to_num(forces)
+        force_violation = torch.linalg.vector_norm(forces, dim=-1) > float(self.cfg.max_allowed_force)
+
+        # 3) natural termination (trajectory complete, etc.)
+        traj_done = getattr(self, "_trajectory_completed",
+                            torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+
+        # 4) separate signals: terminated excludes time_out
+        terminated = (force_violation | traj_done) & (~time_out)
+
+        return terminated.to(torch.bool), time_out.to(torch.bool)
+
 
     def step(self, actions: torch.Tensor):
         """
