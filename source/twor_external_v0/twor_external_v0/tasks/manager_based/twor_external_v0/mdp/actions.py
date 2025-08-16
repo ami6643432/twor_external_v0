@@ -19,229 +19,179 @@ if TYPE_CHECKING:
 
 
 @configclass
-class VariableImpedanceActionTermCfg(ActionTermCfg):
+class VariableImpedanceActionCfg(ActionTermCfg):
     """Configuration for variable impedance action term for RL autotuning."""
     
-    #class_type: type[ActionTerm] = "VariableImpedanceActionTerm"
+    class_type: type[ActionTerm] = "VariableImpedanceAction"
     
-    # Robot asset configuration
-    asset_name: str = "robot"
+    asset_name: str = "robot_min"
     """Name of the robot asset."""
     
-    # Joint specification - only control Servo1 and Servo2
-    #joint_names: list[str] = ["Servo1", "Servo2"]
+    joint_names: list[str] = ["Servo1", "Servo2"]
     """Names of joints to control impedance for."""
     
-    # RL action space configuration (stiffness and damping for 2 joints)
+    command_term_name: str = "joint_position_command"
+    """Name of the command term that provides position references."""
+    
     stiffness_range: tuple[float, float] = (10.0, 5000.0)
     """Range for joint stiffness values [N⋅m/rad]."""
     
-    #damping_range: tuple[float, float] = (0.1, 100.0)
+    damping_range: tuple[float, float] = (0.1, 100.0)
     """Range for joint damping values [N⋅m⋅s/rad]."""
     
-    # Default impedance parameters
-    default_stiffness: float = 1000.0
+    default_stiffness: float = 100.0
     """Default stiffness value [N⋅m/rad]."""
     
-    #default_damping: float = 20.0
+    default_damping: float = 30.0
     """Default damping value [N⋅m⋅s/rad]."""
     
-    # Position command source
-    position_command_source: str = "external_planner"
-    """Source of position commands: 'external_planner' or 'fixed_target'."""
+    debug_contact_forces: bool = True
+    """Whether to print contact forces during control."""
     
-    #fixed_target_positions: list[float] = [0.0, 1.5708]  # Default positions for Servo1, Servo2
-    """Fixed target positions if using fixed target [rad]."""
+    contact_sensor_name: str = "contact_sensor"
+    """Name of contact sensor for force feedback."""
 
 
-class VariableImpedanceActionTerm(ActionTerm):
-    """Variable impedance action term for RL-based impedance parameter autotuning.
-    
-    This action term implements Isaac Lab's variable impedance control mode where:
-    - RL agent outputs stiffness and damping parameters for 2 joints (Servo1, Servo2)
-    - Position commands come from external planner or fixed targets
-    - Uses Isaac Lab's built-in impedance control with variable gains
-    - Action space: [K1, D1, K2, D2] - 4 parameters total
-    """
+class VariableImpedanceAction(ActionTerm):
+    """Variable impedance action term for RL-based impedance parameter autotuning."""
 
-    #cfg: VariableImpedanceActionTermCfg
-    """Configuration for the action term."""
+    cfg: VariableImpedanceActionCfg
 
-    def __init__(self, cfg: VariableImpedanceActionTermCfg, env: ManagerBasedRLEnv) -> None:
-        """Initialize the variable impedance action term.
-
-        Args:
-            cfg: Configuration for the action term.
-            env: The environment object.
-        """
+    def __init__(self, cfg: VariableImpedanceActionCfg, env: ManagerBasedRLEnv) -> None:
+        """Initialize the variable impedance action term."""
         super().__init__(cfg, env)
         
         # Get robot asset
         self._asset: Articulation = env.scene[cfg.asset_name]
-        #self._num_envs = env.num_envs
-        #self._device = env.device
+        self._num_envs = env.num_envs
+        self._device = env.device
         
-        # Get joint indices for controlled joints only
-        # self._joint_ids = []
-        # for joint_name in cfg.joint_names:
-        #     joint_idx, _ = self._asset.find_joints(joint_name)
-        #     self._joint_ids.extend(joint_idx)
+        # Get joint indices
+        self._joint_ids = []
+        for joint_name in cfg.joint_names:
+            joint_idx, _ = self._asset.find_joints(joint_name)
+            self._joint_ids.extend(joint_idx)
         
-        # self._num_joints = len(self._joint_ids)
-        # assert self._num_joints == 2, f"Expected 2 joints (Servo1, Servo2), got {self._num_joints}"
+        self._num_joints = len(self._joint_ids)
         
-        # # Initialize impedance parameters
-        # self._current_stiffness = torch.full(
-        #     (self._num_envs, self._num_joints), 
-        #     cfg.default_stiffness,
-        #     device=self._device,
-        #     dtype=torch.float32
-        # )
+        # Initialize impedance parameters
+        self._current_stiffness = torch.full(
+            (self._num_envs, self._num_joints), 
+            cfg.default_stiffness,
+            device=self._device,
+            dtype=torch.float32
+        )
         
-        # self._current_damping = torch.full(
-        #     (self._num_envs, self._num_joints),
-        #     cfg.default_damping,
-        #     device=self._device,
-        #     dtype=torch.float32
-        # )
+        self._current_damping = torch.full(
+            (self._num_envs, self._num_joints),
+            cfg.default_damping,
+            device=self._device,
+            dtype=torch.float32
+        )
         
-        # # Initialize command tracking
-        # self._desired_joint_pos = torch.zeros(
-        #     (self._num_envs, self._num_joints), 
-        #     device=self._device, 
-        #     dtype=torch.float32
-        # )
+        # Get contact sensor for debugging
+        self._contact_sensor = None
+        if cfg.contact_sensor_name in env.scene:
+            self._contact_sensor = env.scene[cfg.contact_sensor_name]
         
-        # # Set initial positions
-        # if cfg.position_command_source == "fixed_target":
-        #     fixed_pos = torch.tensor(cfg.fixed_target_positions, device=self._device, dtype=torch.float32)
-        #     self._desired_joint_pos[:] = fixed_pos.unsqueeze(0).expand(self._num_envs, -1)
-        # else:
-        #     # Initialize with current positions
-        #     current_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        #     self._desired_joint_pos[:] = current_pos
+        # Step counter for periodic printing
+        self._step_count = 0
 
-    # @property 
-    # def action_dim(self) -> int:
-    #     """Dimension of the action space: 4 (2 stiffness + 2 damping)."""
-    #     return 4
+    @property 
+    def action_dim(self) -> int:
+        """Dimension of the action space: 4 (2 stiffness + 2 damping)."""
+        return 4
         
-    # @property
-    # def current_stiffness(self) -> torch.Tensor:
-    #     """Current joint stiffness parameters."""
-    #     return self._current_stiffness
+    @property
+    def current_stiffness(self) -> torch.Tensor:
+        """Current joint stiffness parameters."""
+        return self._current_stiffness
         
-    # @property
-    # def current_damping(self) -> torch.Tensor:
-    #     """Current joint damping parameters."""
-    #     return self._current_damping
+    @property
+    def current_damping(self) -> torch.Tensor:
+        """Current joint damping parameters."""
+        return self._current_damping
         
-    # @property  
-    # def desired_joint_positions(self) -> torch.Tensor:
-    #     """Current desired joint positions."""
-    #     return self._desired_joint_pos
+    @property  
+    def desired_joint_positions(self) -> torch.Tensor:
+        """Current desired joint positions from command manager."""
+        command_term = self._env.command_manager._terms[self.cfg.command_term_name]
+        return command_term.command
 
-    # def set_external_commands(self, joint_pos: torch.Tensor) -> None:
-    #     """Set external joint position commands from planner.
-        
-    #     Args:
-    #         joint_pos: Desired joint positions [num_envs, 2] for [Servo1, Servo2]
-    #     """
-    #     if self.cfg.position_command_source == "external_planner":
-    #         self._desired_joint_pos[:] = joint_pos
+    @property
+    def contact_forces(self) -> torch.Tensor:
+        """Get current contact forces from sensor."""
+        if self._contact_sensor is not None:
+            forces = self._contact_sensor.data.net_forces_w
+            while forces.ndim > 2:
+                forces = forces.sum(dim=1)
+            return forces
+        return torch.zeros((self._num_envs, 3), device=self._device)
 
-    # def process_actions(self, actions: torch.Tensor) -> None:
-    #     """Process RL actions to update impedance parameters.
+    @property
+    def contact_force_magnitude(self) -> torch.Tensor:
+        """Get contact force magnitude."""
+        forces = self.contact_forces
+        return torch.norm(forces, dim=-1)
 
-    #     Args:
-    #         actions: RL actions [num_envs, 4] containing impedance parameters.
-    #                 Format: [K1, D1, K2, D2] for [Servo1, Servo2]
-    #                 Values are assumed to be in range [-1, 1]
-    #     """
-    #     # Split actions into stiffness and damping components
-    #     stiffness_actions = actions[:, [0, 2]]  # K1, K2
-    #     damping_actions = actions[:, [1, 3]]    # D1, D2
+    def process_actions(self, actions: torch.Tensor) -> None:
+        """Process RL actions to update impedance parameters."""
+        # Split actions into stiffness and damping components
+        stiffness_actions = actions[:, [0, 2]]  # K1, K2
+        damping_actions = actions[:, [1, 3]]    # D1, D2
         
-    #     # Map actions from [-1, 1] to parameter ranges
-    #     self._current_stiffness = self._map_to_stiffness_range(stiffness_actions)
-    #     self._current_damping = self._map_to_damping_range(damping_actions)
-
-    # def _map_to_stiffness_range(self, actions: torch.Tensor) -> torch.Tensor:
-    #     """Map normalized actions [-1, 1] to stiffness range."""
-    #     actions = torch.clamp(actions, -1.0, 1.0)
+        # Map actions from [-1, 1] to parameter ranges
+        self._current_stiffness = self._map_to_stiffness_range(stiffness_actions)
+        self._current_damping = self._map_to_damping_range(damping_actions)
         
-    #     # Linear mapping from [-1, 1] to [min, max]
-    #     stiffness_range = self.cfg.stiffness_range[1] - self.cfg.stiffness_range[0]
-    #     stiffness = self.cfg.stiffness_range[0] + (actions + 1.0) * 0.5 * stiffness_range
+        # Get desired positions from command manager
+        desired_positions = self.desired_joint_positions
         
-    #     return stiffness
-
-    # def _map_to_damping_range(self, actions: torch.Tensor) -> torch.Tensor:
-    #     """Map normalized actions [-1, 1] to damping range."""
-    #     actions = torch.clamp(actions, -1.0, 1.0)
+        # Apply impedance control
+        self._asset.set_joint_position_target(desired_positions, joint_ids=self._joint_ids)
         
-    #     # Linear mapping from [-1, 1] to [min, max]
-    #     damping_range = self.cfg.damping_range[1] - self.cfg.damping_range[0]
-    #     damping = self.cfg.damping_range[0] + (actions + 1.0) * 0.5 * damping_range
-        
-    #     return damping
-
-    # def apply_actions(self) -> None:
-    #     """Apply the variable impedance control.
-        
-    #     This creates the command vector in the format expected by Isaac Lab's
-    #     variable impedance mode: [positions, stiffness, damping]
-    #     """
-    #     # Create full command vector for all joints (including non-controlled ones)
-    #     num_total_joints = self._asset.num_joints
-        
-    #     # Position commands (all joints, but only controlled joints will use impedance)
-    #     position_commands = self._asset.data.joint_pos.clone()
-    #     position_commands[:, self._joint_ids] = self._desired_joint_pos
-        
-    #     # Stiffness commands (only for controlled joints)
-    #     stiffness_commands = torch.zeros((self._num_envs, num_total_joints), device=self._device)
-    #     stiffness_commands[:, self._joint_ids] = self._current_stiffness
-        
-    #     # Damping commands (only for controlled joints)
-    #     damping_commands = torch.zeros((self._num_envs, num_total_joints), device=self._device)
-    #     damping_commands[:, self._joint_ids] = self._current_damping
-        
-    #     # Combine into full command vector as expected by Isaac Lab's variable impedance mode
-    #     # Format: [positions, stiffness, damping]
-    #     full_commands = torch.cat([
-    #         position_commands,
-    #         stiffness_commands, 
-    #         damping_commands
-    #     ], dim=-1)
-        
-    #     # Set the joint position targets with variable impedance
-    #     # Note: This assumes the actuator is configured for variable impedance mode
-    #     self._asset.set_joint_position_target(
-    #         position_commands, 
-    #         stiffness=stiffness_commands,
-    #         damping=damping_commands,
-    #         joint_ids=self._joint_ids
-    #     )
-
-    # def reset(self, env_ids: torch.Tensor | None = None) -> None:
-    #     """Reset the action term.
-
-    #     Args:
-    #         env_ids: Environment indices to reset. If None, reset all environments.
-    #     """
-    #     if env_ids is None:
-    #         env_ids = torch.arange(self._num_envs, device=self._device)
+        # Debug printing
+        if self.cfg.debug_contact_forces and self._step_count % 10 == 0:
+            current_pos = self._asset.data.joint_pos[:, self._joint_ids]
+            current_vel = self._asset.data.joint_vel[:, self._joint_ids]
+            contact_forces = self.contact_forces
+            force_magnitude = self.contact_force_magnitude
             
-    #     # Reset impedance parameters to default values
-    #     self._current_stiffness[env_ids] = self.cfg.default_stiffness
-    #     self._current_damping[env_ids] = self.cfg.default_damping
+            print(f"\n--- Variable Impedance Control (Step {self._step_count}) ---")
+            print(f"RL Actions (normalized): {actions[0]}")
+            print(f"Current Stiffness [Nm/rad]: {self._current_stiffness[0]}")
+            print(f"Current Damping [Nms/rad]: {self._current_damping[0]}")
+            print(f"Desired positions [rad]: {desired_positions[0]}")
+            print(f"Current positions [rad]: {current_pos[0]}")
+            print(f"Position errors [rad]: {(desired_positions - current_pos)[0]}")
+            print(f"Current velocities [rad/s]: {current_vel[0]}")
+            print(f"Contact forces [N]: {contact_forces[0]}")
+            print(f"Force magnitude [N]: {force_magnitude[0]}")
+            print("-" * 60)
         
-    #     # Reset desired positions
-    #     if self.cfg.position_command_source == "fixed_target":
-    #         fixed_pos = torch.tensor(self.cfg.fixed_target_positions, device=self._device, dtype=torch.float32)
-    #         self._desired_joint_pos[env_ids] = fixed_pos.unsqueeze(0).expand(len(env_ids), -1)
-    #     else:
-    #         # Reset to current positions
-    #         current_pos = self._asset.data.joint_pos[env_ids][:, self._joint_ids]
-    #         self._desired_joint_pos[env_ids] = current_pos
+        self._step_count += 1
+
+    def _map_to_stiffness_range(self, actions: torch.Tensor) -> torch.Tensor:
+        """Map normalized actions [-1, 1] to stiffness range."""
+        actions = torch.clamp(actions, -1.0, 1.0)
+        stiffness_range = self.cfg.stiffness_range[1] - self.cfg.stiffness_range[0]
+        stiffness = self.cfg.stiffness_range[0] + (actions + 1.0) * 0.5 * stiffness_range
+        return stiffness
+
+    def _map_to_damping_range(self, actions: torch.Tensor) -> torch.Tensor:
+        """Map normalized actions [-1, 1] to damping range."""
+        actions = torch.clamp(actions, -1.0, 1.0)
+        damping_range = self.cfg.damping_range[1] - self.cfg.damping_range[0]
+        damping = self.cfg.damping_range[0] + (actions + 1.0) * 0.5 * damping_range
+        return damping
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        """Reset the action term."""
+        if env_ids is None:
+            env_ids = torch.arange(self._num_envs, device=self._device)
+            
+        self._current_stiffness[env_ids] = self.cfg.default_stiffness
+        self._current_damping[env_ids] = self.cfg.default_damping
+        
+        if len(env_ids) == self._num_envs:
+            self._step_count = 0

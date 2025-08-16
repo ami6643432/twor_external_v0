@@ -26,7 +26,7 @@ from . import mdp
 ##
 # Pre-defined configs
 ##
-from twor_external_v0.robots.twor import TWOR_CONFIG
+# from twor_external_v0.robots.twor import TWOR_CONFIG
 from twor_external_v0.robots.twor_min import TWOR_MIN_CONFIG
 
 ##
@@ -46,13 +46,8 @@ class TworExternalV0SceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
 
-    # robot - keep scene entity name "robot" but set prim_path to "Twor" (matches direct workflow USD structure)
-    # This aligns with direct env where sensor is attached to Link2 under the Twor prim.
-    robot: ArticulationCfg = TWOR_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Twor")
-
-    # robot_min - keep scene entity name "robot_min" but set prim_path to "Twor_min" (matches direct workflow USD structure)
-    # This aligns with direct env where sensor is attached to Link2 under the Twor_min
-    # robot_min: ArticulationCfg = TWOR_MIN_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Twor_min")
+    # robot_min - using the minimal robot configuration
+    robot_min: ArticulationCfg = TWOR_MIN_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Twor_min")
 
     # Cube object - exactly as in working add_new_robot.py
     cube = RigidObjectCfg(
@@ -68,15 +63,12 @@ class TworExternalV0SceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-0.3, -0.5, 0.25)),
     )
 
-    # Contact sensor - align with direct workflow (attached to Link2 end-effector)
-    # In direct env: prim_path="/World/envs/env_.*/Twor/Link2" stored as contact_L2. We keep the scene key
-    # "contact_sensor" for consistency with manager-based observation/reward configuration.
+    # Contact sensor - aligned with robot_min configuration (attached to Link2 end-effector)
     contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Twor/Link2",     # End-effector link for force sensing
-        # prim_path="{ENV_REGEX_NS}/Twor_min/Link2",     # End-effector link for force sensing
-        update_period=0.0,                          # every physics step
-        history_length=1,                           # only latest contact
-        debug_vis=False,                            # disable visualization (set True to debug)
+        prim_path="{ENV_REGEX_NS}/Twor_min/Link2",     # End-effector link for force sensing
+        update_period=0.0,                            # every physics step
+        history_length=1,                             # only latest contact
+        debug_vis=False,                              # disable visualization (set True to debug)
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube"],  # only collisions with Cube
     )
 
@@ -85,20 +77,34 @@ class TworExternalV0SceneCfg(InteractiveSceneCfg):
 ##
 
 @configclass
+class CommandsCfg:
+    """Command specifications for the MDP."""
+
+    joint_position_command = mdp.JointPositionCommandCfg(
+        asset_name="robot_min",
+        joint_names=["Servo1", "Servo2"],
+        command_type="sinusoidal",  # or "step"
+        amplitude=[0.3, 0.4],  # [rad] for each joint
+        frequency=[0.1, 0.15], # [Hz] for each joint
+        offset=[0.0, 1.5708],  # [rad] starting positions
+        recompute_time=0.0,    # Update every step
+    )
+
+@configclass
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_effort = mdp.JointEffortActionCfg(
-        asset_name="robot",  # This must match the scene entity name
-        joint_names=["Servo1", "Servo2", "Clamp"],  # From URDF
-        scale=0.0
+    variable_impedance = mdp.VariableImpedanceActionCfg(
+        asset_name="robot_min",
+        joint_names=["Servo1", "Servo2"],
+        command_term_name="joint_position_command",
+        stiffness_range=(10.0, 2000.0),
+        damping_range=(0.1, 200.0),
+        default_stiffness=100.0,
+        default_damping=30.0,
+        contact_sensor_name="contact_sensor",
+        debug_contact_forces=True
     )
-
-    # joint_effort = mdp.JointEffortActionCfg(
-    #     asset_name= "robot_min",  # This must match the scene entity name
-    #     joint_names=["Servo1", "Servo2"],  # From URDF
-    #     scale=100.0
-    # )
 
 @configclass
 class ObservationsCfg:
@@ -108,9 +114,8 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        # Contact force magnitude (functional helper returns [B,1])
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, params={"asset_cfg": SceneEntityCfg("robot_min")})
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot_min")})
         contact_force_mag = ObsTerm(
             func=mdp.contact_force_norm,
             params={"sensor_cfg": SceneEntityCfg("contact_sensor")},
@@ -153,10 +158,10 @@ class TerminationsCfg:
 class TworExternalV0EnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for TwoR Variable Impedance Control RL Environment."""
 
-    scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=1, env_spacing=2.0)  # match add_new_robot.py
+    scene: TworExternalV0SceneCfg = TworExternalV0SceneCfg(num_envs=1, env_spacing=2.0)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
-    # commands: CommandsCfg = CommandsCfg()
+    commands: CommandsCfg = CommandsCfg()  # Add this line
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
