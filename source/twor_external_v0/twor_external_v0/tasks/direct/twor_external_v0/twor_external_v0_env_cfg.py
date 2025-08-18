@@ -115,8 +115,8 @@ class TworExternalV0EnvCfg(DirectRLEnvCfg):
     # -------------------------------------------------------------------------
     # Box Pushing Trajectory Parameters (fallback if manual waypoints disabled)
     # -------------------------------------------------------------------------
-    box_start_pos: tuple[float, float, float] = (-0.3, 0.0, 0.1250)    # Initial box position [x, y, z] - CONSISTENT WITH SCENE
-    box_target_pos: tuple[float, float, float] = (-0.4, 0.0, 0.1250)   # Target box position [x, y, z]
+    box_start_pos: tuple[float, float, float] = (-0.3, -0.5, 0.1250)    # Initial box position [x, y, z] - CONSISTENT WITH SCENE
+    box_target_pos: tuple[float, float, float] = (-0.4, -0.5, 0.1250)   # Target box position [x, y, z]
     trajectory_total_time: float = 4.0                                 # Total trajectory execution time [s]
     trajectory_approach_offset: float = 0.02                           # Smaller approach offset for contact [m]
     trajectory_max_count: int = int(4.0 / (1/120))                     # Steps for one trajectory (4 seconds at 120Hz)
